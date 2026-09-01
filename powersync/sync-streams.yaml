@@ -1,0 +1,56 @@
+# PowerSync Sync Streams config for split_tab_app (Milestone 1)
+#
+# This is a version-controlled reference copy of what's pasted into the
+# PowerSync dashboard's "Sync Streams" editor -- PowerSync's replication
+# role (powersync_role) bypasses Postgres RLS entirely, so this file is
+# what actually enforces "you only sync data for trips you belong to."
+#
+# Uses JOINs (PowerSync's current Sync Streams system supports them
+# directly) rather than denormalizing trip_id onto every nested table,
+# which the older "Sync Rules" system required.
+#
+# NOTE: if the dashboard rejects `auth.user_id()`, try `request.user_id()`
+# instead -- the two generations of PowerSync docs disagree on the name
+# and this hasn't been test-deployed yet.
+
+streams:
+  trip_data:
+    queries:
+      # Trips you belong to
+      - SELECT trip.* FROM trip
+          INNER JOIN trip_membership ON trip_membership.trip_id = trip.id
+          WHERE trip_membership.person_id = auth.user_id()
+
+      # Membership rows for those trips (so you can see co-members)
+      - SELECT tm.* FROM trip_membership tm
+          INNER JOIN trip_membership me ON me.trip_id = tm.trip_id
+          WHERE me.person_id = auth.user_id()
+
+      # People who share a trip with you
+      - SELECT p.* FROM person p
+          INNER JOIN trip_membership tm ON tm.person_id = p.id
+          INNER JOIN trip_membership me ON me.trip_id = tm.trip_id
+          WHERE me.person_id = auth.user_id()
+
+      # Expenses on your trips
+      - SELECT expense.* FROM expense
+          INNER JOIN trip_membership ON trip_membership.trip_id = expense.trip_id
+          WHERE trip_membership.person_id = auth.user_id()
+
+      # Expense items on your trips
+      - SELECT expense_item.* FROM expense_item
+          INNER JOIN expense ON expense.id = expense_item.expense_id
+          INNER JOIN trip_membership ON trip_membership.trip_id = expense.trip_id
+          WHERE trip_membership.person_id = auth.user_id()
+
+      # Claims on your trips
+      - SELECT claim.* FROM claim
+          INNER JOIN expense_item ON expense_item.id = claim.item_id
+          INNER JOIN expense ON expense.id = expense_item.expense_id
+          INNER JOIN trip_membership ON trip_membership.trip_id = expense.trip_id
+          WHERE trip_membership.person_id = auth.user_id()
+
+      # Payments on your trips
+      - SELECT payment.* FROM payment
+          INNER JOIN trip_membership ON trip_membership.trip_id = payment.trip_id
+          WHERE trip_membership.person_id = auth.user_id()
