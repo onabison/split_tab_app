@@ -1,3 +1,6 @@
+config:
+  edition: 3
+
 # PowerSync Sync Streams config for split_tab_app (Milestone 1)
 #
 # This is a version-controlled reference copy of what's pasted into the
