@@ -25,13 +25,13 @@ streams:
           WHERE trip_membership.person_id = auth.user_id()
 
       # Membership rows for those trips (so you can see co-members)
-      - SELECT tm.* FROM trip_membership tm
-          INNER JOIN trip_membership me ON me.trip_id = tm.trip_id
+      - SELECT trip_membership.* FROM trip_membership
+          INNER JOIN trip_membership me ON me.trip_id = trip_membership.trip_id
           WHERE me.person_id = auth.user_id()
 
       # People who share a trip with you
-      - SELECT p.* FROM person p
-          INNER JOIN trip_membership tm ON tm.person_id = p.id
+      - SELECT person.* FROM person
+          INNER JOIN trip_membership tm ON tm.person_id = person.id
           INNER JOIN trip_membership me ON me.trip_id = tm.trip_id
           WHERE me.person_id = auth.user_id()
 
