@@ -4,6 +4,10 @@ import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
 import 'react-native-reanimated';
 
+// Side-effect import: sets up the PowerSync database, the Supabase
+// connector, and the auth-state listener that connects/disconnects sync.
+import '@/lib/powersync/system';
+
 import { useColorScheme } from '@/components/useColorScheme';
 
 export {
