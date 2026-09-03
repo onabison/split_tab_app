@@ -8,6 +8,7 @@ import 'react-native-reanimated';
 // connector, and the auth-state listener that connects/disconnects sync.
 import '@/lib/powersync/system';
 
+import { AuthProvider, useAuth } from '@/lib/auth/AuthProvider';
 import { useColorScheme } from '@/components/useColorScheme';
 
 export {
@@ -43,17 +44,33 @@ export default function RootLayout() {
     return null;
   }
 
-  return <RootLayoutNav />;
+  return (
+    <AuthProvider>
+      <RootLayoutNav />
+    </AuthProvider>
+  );
 }
 
 function RootLayoutNav() {
   const colorScheme = useColorScheme();
+  const { session, initialized } = useAuth();
+
+  // Wait for the initial local session check before picking a stack, so a
+  // signed-in user never sees a flash of the sign-in screen on cold start.
+  if (!initialized) {
+    return null;
+  }
 
   return (
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
       <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
+        <Stack.Protected guard={!!session}>
+          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+          <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
+        </Stack.Protected>
+        <Stack.Protected guard={!session}>
+          <Stack.Screen name="(auth)" options={{ headerShown: false }} />
+        </Stack.Protected>
       </Stack>
     </ThemeProvider>
   );
