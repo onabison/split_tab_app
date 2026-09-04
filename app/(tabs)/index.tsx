@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import { router } from 'expo-router';
 import {
   ActivityIndicator,
   FlatList,
@@ -13,20 +14,7 @@ import {
 import { useQuery, useStatus } from '@powersync/react';
 
 import { useAuth } from '@/lib/auth/AuthProvider';
-import { powersync } from '@/lib/powersync/system';
 import { supabase } from '@/lib/supabase';
-
-// Not cryptographically secure -- fine here since these are just local
-// primary keys, not anything security-sensitive. Avoids pulling in
-// react-native-get-random-values / expo-crypto (native modules that would
-// need a fresh `expo prebuild` + rebuild) just to generate an id.
-function uuidv4() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
 
 type TripType = 'vacation' | 'dinner' | 'outing';
 
@@ -142,11 +130,10 @@ function TripTypeAndDateFields({
 }
 
 // Milestone 1's Trips test screen, now with real create/join UI (Stage 1g's
-// trip-type-adaptive fields) and in-place trip editing (Stage 1j) instead of
-// the hardcoded 'vacation' placeholder. The debug status line and "add test
-// expense" button are still here from Milestone 1 -- useful while Milestone 2
-// (real trip detail/expense UI) isn't built yet, and will go away once that
-// replaces this screen.
+// trip-type-adaptive fields) and in-place trip editing (Stage 1j). Tapping a
+// trip card now opens its real detail screen (Milestone 2) instead of the
+// old "add test expense" placeholder button, which is gone now that there's
+// somewhere real for expenses to live.
 export default function TripsScreen() {
   const status = useStatus();
   const { session } = useAuth();
@@ -163,7 +150,6 @@ export default function TripsScreen() {
   const [inviteCode, setInviteCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [addingExpenseFor, setAddingExpenseFor] = useState<string | null>(null);
 
   // Editing an existing trip in place on its card -- only the creator sees
   // the "Edit" action that sets this (Stage 1j).
@@ -265,43 +251,6 @@ export default function TripsScreen() {
       return;
     }
     cancelEditing();
-  }
-
-  async function addTestExpense(tripId: string) {
-    setAddingExpenseFor(tripId);
-    setError(null);
-    try {
-      const {
-        data: { session: currentSession },
-      } = await supabase.auth.getSession();
-      if (!currentSession) throw new Error('Not signed in');
-
-      const now = new Date().toISOString();
-      await powersync.execute(
-        `INSERT INTO expense
-           (id, trip_id, paid_by, merchant, description, expense_date, type, status, total, tax, tip, needs_review, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          uuidv4(),
-          tripId,
-          currentSession.user.id,
-          'Test Merchant',
-          'Offline test expense',
-          now,
-          'manual',
-          'pending',
-          12.34,
-          0,
-          0,
-          0,
-          now,
-        ]
-      );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAddingExpenseFor(null);
-    }
   }
 
   return (
@@ -416,11 +365,11 @@ export default function TripsScreen() {
         }
 
         return (
-          <View style={styles.tripCard}>
+          <Pressable style={styles.tripCard} onPress={() => router.push(`/trip/${item.id}`)}>
             <View style={styles.tripCardHeader}>
               <Text style={styles.tripName}>{item.name}</Text>
               {canEdit ? (
-                <Pressable onPress={() => startEditing(item)}>
+                <Pressable onPress={() => startEditing(item)} hitSlop={8}>
                   <Text style={styles.editLink}>Edit</Text>
                 </Pressable>
               ) : null}
@@ -429,16 +378,7 @@ export default function TripsScreen() {
               {item.type} · {item.status} · invite code {item.invite_code}
             </Text>
             <Text style={styles.tripDate}>{formatTripDate(item.starts_at, item.ends_at)}</Text>
-            <Pressable
-              style={styles.smallButton}
-              onPress={() => addTestExpense(item.id)}
-              disabled={addingExpenseFor === item.id}
-            >
-              <Text style={styles.buttonText}>
-                {addingExpenseFor === item.id ? 'Adding…' : 'Add test expense ($12.34)'}
-              </Text>
-            </Pressable>
-          </View>
+          </Pressable>
         );
       }}
     />
