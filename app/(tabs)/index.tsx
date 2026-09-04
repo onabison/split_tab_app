@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { useQuery } from '@powersync/react';
+import { useQuery, useStatus } from '@powersync/react';
 
 import { powersync } from '@/lib/powersync/system';
 import { supabase } from '@/lib/supabase';
@@ -31,7 +31,28 @@ type TripRow = {
   type: string;
   status: string;
   invite_code: string;
+  starts_at: string;
+  ends_at: string | null;
 };
+
+function formatTripDate(startsAt: string, endsAt: string | null): string {
+  const start = new Date(startsAt);
+  const startFull = start.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  if (!endsAt) return startFull;
+
+  const end = new Date(endsAt);
+  const startShort = start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const endFull = end.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  return `${startShort} – ${endFull}`;
+}
 
 // Milestone 1 test screen: proves the whole pipeline end to end --
 // creating/joining a trip via the online-only RPCs, reading trips back
@@ -39,8 +60,9 @@ type TripRow = {
 // local SQLite db (works offline) to confirm it uploads to Supabase via
 // the connector. Not final UI -- just enough to see the round trip work.
 export default function TripsScreen() {
+  const status = useStatus();
   const { data: trips, isLoading } = useQuery<TripRow>(
-    'SELECT id, name, type, status, invite_code FROM trip ORDER BY created_at DESC'
+    'SELECT id, name, type, status, invite_code, starts_at, ends_at FROM trip ORDER BY created_at DESC'
   );
 
   const [newTripName, setNewTripName] = useState('');
@@ -129,6 +151,14 @@ export default function TripsScreen() {
         </Pressable>
       </View>
 
+      <Text style={styles.debug}>
+        connected: {String(status.connected)} · connecting: {String(status.connecting)} ·
+        hasSynced: {String(status.hasSynced)} · downloading: {String(status.downloading)}
+        {'\n'}lastSyncedAt: {status.lastSyncedAt ? status.lastSyncedAt.toISOString() : 'never'}
+        {status.downloadError ? `\ndownloadError: ${status.downloadError.message}` : ''}
+        {status.uploadError ? `\nuploadError: ${status.uploadError.message}` : ''}
+      </Text>
+
       <View style={styles.row}>
         <TextInput
           style={styles.input}
@@ -174,6 +204,7 @@ export default function TripsScreen() {
               <Text style={styles.tripMeta}>
                 {item.type} · {item.status} · invite code {item.invite_code}
               </Text>
+              <Text style={styles.tripDate}>{formatTripDate(item.starts_at, item.ends_at)}</Text>
               <Pressable
                 style={styles.smallButton}
                 onPress={() => addTestExpense(item.id)}
@@ -201,6 +232,7 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: 28, fontWeight: '700' },
   signOut: { color: '#2f6fed', fontSize: 14 },
+  debug: { fontSize: 11, color: '#999', marginBottom: 12, fontFamily: 'SpaceMono' },
   row: { flexDirection: 'row', gap: 8, marginBottom: 10 },
   input: {
     flex: 1,
@@ -236,4 +268,5 @@ const styles = StyleSheet.create({
   },
   tripName: { fontSize: 17, fontWeight: '600' },
   tripMeta: { color: '#666', marginTop: 2, fontSize: 13 },
+  tripDate: { color: '#888', marginTop: 4, fontSize: 12 },
 });

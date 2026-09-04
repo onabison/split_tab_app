@@ -11,6 +11,7 @@ config:
   edition: 3
 streams:
   trip_data:
+    auto_subscribe: true
     queries:
       - SELECT trip.* FROM trip INNER JOIN trip_membership ON trip_membership.trip_id = trip.id WHERE trip_membership.person_id = auth.user_id()
       - SELECT trip_membership.* FROM trip_membership INNER JOIN trip_membership me ON me.trip_id = trip_membership.trip_id WHERE me.person_id = auth.user_id()
