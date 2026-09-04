@@ -8,7 +8,10 @@ import 'react-native-reanimated';
 // connector, and the auth-state listener that connects/disconnects sync.
 import '@/lib/powersync/system';
 
+import { PowerSyncContext } from '@powersync/react';
+
 import { AuthProvider, useAuth } from '@/lib/auth/AuthProvider';
+import { powersync } from '@/lib/powersync/system';
 import { useColorScheme } from '@/components/useColorScheme';
 
 export {
@@ -45,9 +48,11 @@ export default function RootLayout() {
   }
 
   return (
-    <AuthProvider>
-      <RootLayoutNav />
-    </AuthProvider>
+    <PowerSyncContext.Provider value={powersync}>
+      <AuthProvider>
+        <RootLayoutNav />
+      </AuthProvider>
+    </PowerSyncContext.Provider>
   );
 }
 

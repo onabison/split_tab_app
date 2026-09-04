@@ -4,6 +4,8 @@
   "version": "1.0.0",
   "dependencies": {
     "@op-engineering/op-sqlite": "^17.2.0",
+    "@powersync/common": "^2.1.0",
+    "@powersync/react": "^2.0.0",
     "@powersync/react-native": "^2.1.0",
     "@react-native-async-storage/async-storage": "^3.1.1",
     "@supabase/supabase-js": "^2.114.0",
