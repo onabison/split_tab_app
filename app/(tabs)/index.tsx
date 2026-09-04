@@ -256,7 +256,9 @@ export default function TripsScreen() {
             {busy ? (
               <ActivityIndicator color="#fff" />
             ) : (
-              <Text style={styles.buttonText}>Create trip</Text>
+              <Text style={styles.buttonText}>
+                Create {TRIP_TYPES.find((t) => t.value === tripType)?.label}
+              </Text>
             )}
           </Pressable>
 
