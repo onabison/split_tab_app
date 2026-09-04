@@ -16,21 +16,27 @@ type Step = 'email' | 'code';
 
 export default function SignIn() {
   const [step, setStep] = useState<Step>('email');
+  const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function sendCode() {
-    const trimmed = email.trim();
-    if (!trimmed) {
+    const trimmedName = name.trim();
+    const trimmedEmail = email.trim();
+    if (!trimmedName) {
+      setError('Enter your name.');
+      return;
+    }
+    if (!trimmedEmail) {
       setError('Enter your email address.');
       return;
     }
     setLoading(true);
     setError(null);
     const { error: otpError } = await supabase.auth.signInWithOtp({
-      email: trimmed,
+      email: trimmedEmail,
       options: { shouldCreateUser: true },
     });
     setLoading(false);
@@ -54,9 +60,21 @@ export default function SignIn() {
       token: trimmed,
       type: 'email',
     });
-    setLoading(false);
     if (verifyError) {
+      setLoading(false);
       setError(verifyError.message);
+      return;
+    }
+
+    // Verifying only creates the auth.users row -- our own `person` row
+    // (which trip/expense/etc. foreign keys point at) doesn't exist until
+    // this RPC runs. Must happen before the person can create/join a trip.
+    const { error: personError } = await supabase.rpc('upsert_person', {
+      p_name: name.trim(),
+    });
+    setLoading(false);
+    if (personError) {
+      setError(personError.message);
       return;
     }
     // No manual navigation here: AuthProvider's onAuthStateChange picks up
@@ -73,6 +91,16 @@ export default function SignIn() {
 
       {step === 'email' ? (
         <View>
+          <Text style={styles.label}>Name</Text>
+          <TextInput
+            style={styles.input}
+            value={name}
+            onChangeText={setName}
+            placeholder="Your name"
+            autoCapitalize="words"
+            autoCorrect={false}
+            editable={!loading}
+          />
           <Text style={styles.label}>Email</Text>
           <TextInput
             style={styles.input}

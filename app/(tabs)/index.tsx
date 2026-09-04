@@ -122,7 +122,12 @@ export default function TripsScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Trips</Text>
+      <View style={styles.headerRow}>
+        <Text style={styles.title}>Trips</Text>
+        <Pressable onPress={() => supabase.auth.signOut()}>
+          <Text style={styles.signOut}>Sign out</Text>
+        </Pressable>
+      </View>
 
       <View style={styles.row}>
         <TextInput
@@ -188,7 +193,14 @@ export default function TripsScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, padding: 20, paddingTop: 60 },
-  title: { fontSize: 28, fontWeight: '700', marginBottom: 20 },
+  headerRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  title: { fontSize: 28, fontWeight: '700' },
+  signOut: { color: '#2f6fed', fontSize: 14 },
   row: { flexDirection: 'row', gap: 8, marginBottom: 10 },
   input: {
     flex: 1,
