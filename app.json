@@ -35,6 +35,13 @@
           "resizeMode": "contain",
           "backgroundColor": "#ffffff"
         }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "TabMate needs access to your photos so you can attach a receipt image.",
+          "cameraPermission": "TabMate needs access to your camera so you can scan a receipt."
+        }
       ]
     ],
     "experiments": {

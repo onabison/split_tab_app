@@ -9,10 +9,12 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
 import { useQuery } from '@powersync/react';
 
 import { useAuth } from '@/lib/auth/AuthProvider';
 import { powersync } from '@/lib/powersync/system';
+import { supabase } from '@/lib/supabase';
 import { uuidv4 } from '@/lib/uuid';
 
 type TripRow = {
@@ -92,6 +94,10 @@ export default function TripDetailScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [scanBusy, setScanBusy] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [lastScanPath, setLastScanPath] = useState<string | null>(null);
+
   const memberName = useMemo(() => {
     const map = new Map((members ?? []).map((m) => [m.person_id, m.name]));
     return (personId: string) => map.get(personId) ?? 'Someone';
@@ -137,6 +143,53 @@ export default function TripDetailScreen() {
     }
     return map;
   }, [members, expenses, items, claimsByItem]);
+
+  // Milestone 3, step 1: capture + upload only. Turning the uploaded photo
+  // into an expense + line items (OCR parsing) is the next step, once
+  // we've checked extraction quality against real receipts -- see
+  // build-roadmap.md's Milestone 3 entry.
+  async function uploadReceiptPhoto(uri: string) {
+    setScanBusy(true);
+    setScanError(null);
+    try {
+      const response = await fetch(uri);
+      const blob = await response.blob();
+      const path = `${tripId}/${uuidv4()}.jpg`;
+      const { error: uploadError } = await supabase.storage
+        .from('receipts')
+        .upload(path, blob, { contentType: 'image/jpeg' });
+      if (uploadError) throw uploadError;
+      setLastScanPath(path);
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanBusy(false);
+    }
+  }
+
+  async function takePhoto() {
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) {
+      setScanError('Camera permission is required to scan a receipt.');
+      return;
+    }
+    const result = await ImagePicker.launchCameraAsync({ quality: 0.8 });
+    if (!result.canceled && result.assets[0]) {
+      await uploadReceiptPhoto(result.assets[0].uri);
+    }
+  }
+
+  async function pickPhoto() {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) {
+      setScanError('Photo library permission is required to choose a receipt.');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({ quality: 0.8 });
+    if (!result.canceled && result.assets[0]) {
+      await uploadReceiptPhoto(result.assets[0].uri);
+    }
+  }
 
   async function addExpense() {
     const desc = description.trim();
@@ -241,6 +294,32 @@ export default function TripDetailScreen() {
                 </View>
               );
             })}
+
+            <Text style={styles.sectionTitle}>Scan a receipt</Text>
+            <View style={styles.typeRow}>
+              <Pressable
+                style={[styles.button, styles.halfButton]}
+                onPress={takePhoto}
+                disabled={scanBusy}
+              >
+                <Text style={styles.buttonText}>Take photo</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.button, styles.halfButton]}
+                onPress={pickPhoto}
+                disabled={scanBusy}
+              >
+                <Text style={styles.buttonText}>Choose photo</Text>
+              </Pressable>
+            </View>
+            {scanBusy ? <ActivityIndicator style={{ marginTop: 4, marginBottom: 8 }} /> : null}
+            {scanError ? <Text style={styles.error}>{scanError}</Text> : null}
+            {lastScanPath ? (
+              <Text style={styles.label}>
+                Uploaded. OCR parsing comes next, once we've checked extraction quality on real
+                receipts.
+              </Text>
+            ) : null}
 
             <Text style={styles.sectionTitle}>Add an expense</Text>
             <TextInput
@@ -361,6 +440,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   typeButtonSelected: { backgroundColor: '#2f6fed', borderColor: '#2f6fed' },
+  halfButton: { flex: 1 },
   typeButtonText: { color: '#333', fontWeight: '600', fontSize: 13 },
   typeButtonTextSelected: { color: '#fff' },
   button: {
