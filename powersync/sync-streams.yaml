@@ -18,5 +18,6 @@ streams:
       - SELECT person.* FROM person INNER JOIN trip_membership tm ON tm.person_id = person.id INNER JOIN trip_membership me ON me.trip_id = tm.trip_id WHERE me.person_id = auth.user_id()
       - SELECT expense.* FROM expense INNER JOIN trip_membership ON trip_membership.trip_id = expense.trip_id WHERE trip_membership.person_id = auth.user_id()
       - SELECT expense_item.* FROM expense_item INNER JOIN expense ON expense.id = expense_item.expense_id INNER JOIN trip_membership ON trip_membership.trip_id = expense.trip_id WHERE trip_membership.person_id = auth.user_id()
+      - SELECT expense_payment.* FROM expense_payment INNER JOIN expense ON expense.id = expense_payment.expense_id INNER JOIN trip_membership ON trip_membership.trip_id = expense.trip_id WHERE trip_membership.person_id = auth.user_id()
       - SELECT claim.* FROM claim INNER JOIN expense_item ON expense_item.id = claim.item_id INNER JOIN expense ON expense.id = expense_item.expense_id INNER JOIN trip_membership ON trip_membership.trip_id = expense.trip_id WHERE trip_membership.person_id = auth.user_id()
       - SELECT payment.* FROM payment INNER JOIN trip_membership ON trip_membership.trip_id = payment.trip_id WHERE trip_membership.person_id = auth.user_id()

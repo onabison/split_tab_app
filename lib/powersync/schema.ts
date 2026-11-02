@@ -77,6 +77,19 @@ const expense_item = new Table(
   { indexes: { expense: ['expense_id'] } }
 );
 
+// Extra payers on a split check (0006): "Add my payment" on an existing
+// scanned expense instead of scanning the same receipt again.
+const expense_payment = new Table(
+  {
+    expense_id: column.text,
+    person_id: column.text,
+    amount: column.real, // their part of the bill, before tip
+    tip: column.real,
+    created_at: column.text
+  },
+  { indexes: { expense: ['expense_id'] } }
+);
+
 const claim = new Table(
   {
     item_id: column.text,
@@ -109,6 +122,7 @@ export const AppSchema = new Schema({
   trip_membership,
   expense,
   expense_item,
+  expense_payment,
   claim,
   payment
 });
