@@ -21,11 +21,19 @@ import {
 } from '../_shared/receipt-ocr.mjs';
 
 const MAX_BYTES = 7 * 1024 * 1024; // base64 adds ~33%; Claude's limit is 10 MB encoded.
-const MEDIA_TYPES: Record<string, string> = {
-  'image/jpeg': 'image/jpeg',
-  'image/png': 'image/png',
-  'image/webp': 'image/webp',
-};
+// Detect the image type from the file's first bytes rather than trusting the
+// stored Content-Type: uploads from React Native can be stored/served with a
+// generic type (seen 2026-11-01: a real JPEG came back as "text/plain").
+function sniffImageType(b: Uint8Array): string | null {
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (
+    b.length >= 12 &&
+    String.fromCharCode(b[0], b[1], b[2], b[3]) === 'RIFF' &&
+    String.fromCharCode(b[8], b[9], b[10], b[11]) === 'WEBP'
+  ) return 'image/webp';
+  return null;
+}
 
 export default {
   fetch: withSupabase({ auth: 'user' }, async (req, ctx) => {
@@ -63,16 +71,20 @@ export default {
       return Response.json({ error: `Could not read receipt: ${dlError?.message ?? 'not found'}` }, { status: 403 });
     }
 
-    const mediaType = MEDIA_TYPES[file.type];
-    if (!mediaType) {
-      return Response.json({ error: `Unsupported image type "${file.type}" (need JPEG/PNG/WebP)` }, { status: 415 });
-    }
     if (file.size > MAX_BYTES) {
       return Response.json({ error: `Image is too large (${file.size} bytes)` }, { status: 413 });
     }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const mediaType = sniffImageType(bytes);
+    if (!mediaType) {
+      return Response.json(
+        { error: `File is not a JPEG/PNG/WebP image (stored as "${file.type}", ${bytes.length} bytes)` },
+        { status: 415 }
+      );
+    }
 
     try {
-      const imageBase64 = Buffer.from(await file.arrayBuffer()).toString('base64');
+      const imageBase64 = Buffer.from(bytes).toString('base64');
       const result = await extractReceipt({ apiKey, model, imageBase64, mediaType });
       return Response.json({
         receipt: result.receipt,

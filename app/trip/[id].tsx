@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { useQuery } from '@powersync/react';
+import { FunctionsHttpError } from '@supabase/supabase-js';
 
 import { useAuth } from '@/lib/auth/AuthProvider';
 import { powersync } from '@/lib/powersync/system';
@@ -26,9 +27,50 @@ type TripRow = {
 };
 
 type MemberRow = { person_id: string; name: string };
-type ExpenseRow = { id: string; description: string | null; total: number; paid_by: string };
-type ItemRow = { id: string; expense_id: string; description: string | null; price: number };
+type ExpenseRow = {
+  id: string;
+  description: string | null;
+  merchant: string | null;
+  total: number;
+  receipt_total: number | null;
+  tip: number | null;
+  type: string;
+  paid_by: string;
+};
+type ItemRow = {
+  id: string;
+  expense_id: string;
+  description: string | null;
+  price: number;
+  quantity: number | null;
+  modifier_of_item_id: string | null;
+  line_order: number | null;
+};
 type ClaimRow = { id: string; item_id: string; participant_person_id: string };
+
+// Shape returned by the ocr-receipt Edge Function
+// (supabase/functions/_shared/receipt-ocr.mjs RECEIPT_SCHEMA).
+type OcrItem = {
+  line: number;
+  description: string;
+  quantity: number;
+  price: number;
+  modifier_of_line: number | null;
+  uncertain: boolean;
+};
+type OcrReceipt = {
+  merchant: string | null;
+  receipt_date: string | null;
+  items: OcrItem[];
+  subtotal: number | null;
+  tax: number | null;
+  tip: number | null;
+  total: number | null;
+  amount_charged: number | null;
+  uncertain_fields: string[];
+  notes: string | null;
+};
+type ScanResult = { path: string; receipt: OcrReceipt; problems: string[] };
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -42,12 +84,37 @@ function formatMoney(n: number): string {
   return `$${Math.abs(n).toFixed(2)}`;
 }
 
-// Milestone 2's walking skeleton: a manual expense, itemized-style claiming
-// (even split among whoever claims), and a running tally -- the simplest
-// version of the core loop, proven before OCR (Milestone 3) is built on
-// top of it. Each manual expense gets exactly one expense_item representing
-// its full amount; OCR will produce multiple items per expense, at which
-// point this screen needs a per-item list instead of one row per expense.
+function parseMoney(s: string): number | null {
+  const t = s.trim();
+  if (t === '') return 0;
+  const n = Number(t);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : null;
+}
+
+async function functionErrorMessage(error: unknown): Promise<string> {
+  if (error instanceof FunctionsHttpError) {
+    try {
+      const body = await error.context.json();
+      if (body?.error) return String(body.error);
+    } catch {
+      // fall through to the generic message
+    }
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+// Trip detail: running tally, receipt scanning (Milestone 3), manual
+// expenses (Milestone 2), and per-item claiming.
+//
+// Money model:
+// - expense.total is what the payer actually paid, tip included. For a
+//   split check (each person scans the part they paid -- decided
+//   2026-11-01) that's their part, not the whole bill; the whole bill is
+//   kept in expense.receipt_total.
+// - Tax and tip are shared in proportion to what each person claimed
+//   (Stage 1 #7): an item's effective cost is its printed price scaled by
+//   expense.total / (sum of the expense's item prices). For a manual
+//   expense the scale is 1.
 export default function TripDetailScreen() {
   const params = useLocalSearchParams<{ id: string }>();
   const tripId = Array.isArray(params.id) ? params.id[0] : params.id ?? '';
@@ -68,14 +135,18 @@ export default function TripDetailScreen() {
   );
 
   const { data: expenses, isLoading: expensesLoading } = useQuery<ExpenseRow>(
-    'SELECT id, description, total, paid_by FROM expense WHERE trip_id = ? ORDER BY created_at DESC',
+    `SELECT id, description, merchant, total, receipt_total, tip, type, paid_by
+     FROM expense WHERE trip_id = ? ORDER BY created_at DESC`,
     [tripId]
   );
 
   const { data: items } = useQuery<ItemRow>(
-    `SELECT ei.id as id, ei.expense_id as expense_id, ei.description as description, ei.price as price
+    `SELECT ei.id as id, ei.expense_id as expense_id, ei.description as description,
+            ei.price as price, ei.quantity as quantity,
+            ei.modifier_of_item_id as modifier_of_item_id, ei.line_order as line_order
      FROM expense_item ei JOIN expense e ON e.id = ei.expense_id
-     WHERE e.trip_id = ?`,
+     WHERE e.trip_id = ?
+     ORDER BY ei.line_order, ei.created_at`,
     [tripId]
   );
 
@@ -93,21 +164,29 @@ export default function TripDetailScreen() {
   const [payerId, setPayerId] = useState<string | undefined>(currentUserId);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showManual, setShowManual] = useState(false);
 
-  const [scanBusy, setScanBusy] = useState(false);
+  const [scanBusy, setScanBusy] = useState<null | 'uploading' | 'reading' | 'saving'>(null);
   const [scanError, setScanError] = useState<string | null>(null);
-  const [lastScanPath, setLastScanPath] = useState<string | null>(null);
+  const [scan, setScan] = useState<ScanResult | null>(null);
+  const [scanPaid, setScanPaid] = useState('');
+  const [scanTip, setScanTip] = useState('');
+  const [scanPayerId, setScanPayerId] = useState<string | undefined>(currentUserId);
+
+  // Add-on suggestions the user answered "No" to (this session only).
+  const [dismissedAddOns, setDismissedAddOns] = useState<Set<string>>(new Set());
 
   const memberName = useMemo(() => {
     const map = new Map((members ?? []).map((m) => [m.person_id, m.name]));
     return (personId: string) => map.get(personId) ?? 'Someone';
   }, [members]);
 
-  // One item per expense for now -- see the file-level comment above.
-  const itemByExpense = useMemo(() => {
-    const map = new Map<string, ItemRow>();
+  const itemsByExpense = useMemo(() => {
+    const map = new Map<string, ItemRow[]>();
     for (const item of items ?? []) {
-      if (!map.has(item.expense_id)) map.set(item.expense_id, item);
+      const list = map.get(item.expense_id) ?? [];
+      list.push(item);
+      map.set(item.expense_id, list);
     }
     return map;
   }, [items]);
@@ -122,35 +201,56 @@ export default function TripDetailScreen() {
     return map;
   }, [claims]);
 
-  // Running tally (Stage 1 core loop): each person's net float is what
-  // they've paid across expenses, minus their even share of whatever
-  // they've claimed. Positive = they're owed money; negative = they owe.
-  // An item nobody has claimed yet doesn't count against anyone -- it's an
-  // open liability, not automatically split across the whole trip.
+  // Running tally: what each person paid, minus their share of what they
+  // claimed (tax/tip included proportionally -- see the money model above).
+  // Unclaimed items don't count against anyone yet.
   const balances = useMemo(() => {
     const map = new Map<string, number>();
     for (const member of members ?? []) map.set(member.person_id, 0);
     for (const expense of expenses ?? []) {
       map.set(expense.paid_by, (map.get(expense.paid_by) ?? 0) + expense.total);
-    }
-    for (const item of items ?? []) {
-      const itemClaims = claimsByItem.get(item.id) ?? [];
-      if (itemClaims.length === 0) continue;
-      const share = item.price / itemClaims.length;
-      for (const claim of itemClaims) {
-        map.set(claim.participant_person_id, (map.get(claim.participant_person_id) ?? 0) - share);
+      const expenseItems = itemsByExpense.get(expense.id) ?? [];
+      const itemSum = expenseItems.reduce((s, i) => s + i.price, 0);
+      const scale = itemSum > 0 ? expense.total / itemSum : 1;
+      for (const item of expenseItems) {
+        const itemClaims = claimsByItem.get(item.id) ?? [];
+        if (itemClaims.length === 0) continue;
+        const share = (item.price * scale) / itemClaims.length;
+        for (const claim of itemClaims) {
+          map.set(claim.participant_person_id, (map.get(claim.participant_person_id) ?? 0) - share);
+        }
       }
     }
     return map;
-  }, [members, expenses, items, claimsByItem]);
+  }, [members, expenses, itemsByExpense, claimsByItem]);
 
-  // Milestone 3, step 1: capture + upload only. Turning the uploaded photo
-  // into an expense + line items (OCR parsing) is the next step, once
-  // we've checked extraction quality against real receipts -- see
-  // build-roadmap.md's Milestone 3 entry.
+  // What the current user owes for each expense: their claimed items'
+  // prices, scaled for tax/tip exactly like the running tally above.
+  const myShareByExpense = useMemo(() => {
+    const map = new Map<string, number>();
+    if (!currentUserId) return map;
+    for (const expense of expenses ?? []) {
+      const expenseItems = itemsByExpense.get(expense.id) ?? [];
+      const itemSum = expenseItems.reduce((s, i) => s + i.price, 0);
+      const scale = itemSum > 0 ? expense.total / itemSum : 1;
+      let mine = 0;
+      for (const item of expenseItems) {
+        const itemClaims = claimsByItem.get(item.id) ?? [];
+        if (itemClaims.some((c) => c.participant_person_id === currentUserId)) {
+          mine += (item.price * scale) / itemClaims.length;
+        }
+      }
+      if (mine > 0) map.set(expense.id, mine);
+    }
+    return map;
+  }, [currentUserId, expenses, itemsByExpense, claimsByItem]);
+
+  // Milestone 3: upload the photo, then have the ocr-receipt Edge Function
+  // read it, then show it for review before anything is saved.
   async function uploadReceiptPhoto(uri: string) {
-    setScanBusy(true);
+    setScanBusy('uploading');
     setScanError(null);
+    setScan(null);
     try {
       const response = await fetch(uri);
       const blob = await response.blob();
@@ -159,11 +259,117 @@ export default function TripDetailScreen() {
         .from('receipts')
         .upload(path, blob, { contentType: 'image/jpeg' });
       if (uploadError) throw uploadError;
-      setLastScanPath(path);
+
+      setScanBusy('reading');
+      const { data, error: fnError } = await supabase.functions.invoke('ocr-receipt', {
+        body: { path },
+      });
+      if (fnError) throw new Error(await functionErrorMessage(fnError));
+      const receipt = data.receipt as OcrReceipt;
+      const itemSum = receipt.items.reduce((s, i) => s + i.price, 0);
+      const paid = receipt.amount_charged ?? receipt.total ?? itemSum;
+      setScan({ path, receipt, problems: data.problems ?? [] });
+      setScanPaid(paid.toFixed(2));
+      setScanTip(receipt.tip != null ? receipt.tip.toFixed(2) : '');
+      setScanPayerId(currentUserId);
     } catch (e) {
       setScanError(e instanceof Error ? e.message : String(e));
     } finally {
-      setScanBusy(false);
+      setScanBusy(null);
+    }
+  }
+
+  async function saveScan() {
+    if (!scan) return;
+    const paid = parseMoney(scanPaid);
+    const tip = parseMoney(scanTip);
+    if (paid == null || paid <= 0) {
+      setScanError('Enter the amount you paid (before tip).');
+      return;
+    }
+    if (tip == null) {
+      setScanError('Tip must be a number (or leave it empty).');
+      return;
+    }
+    if (!scanPayerId) {
+      setScanError('Pick who paid.');
+      return;
+    }
+    const r = scan.receipt;
+    if (r.items.length === 0) {
+      setScanError('No items were found on this receipt.');
+      return;
+    }
+
+    setScanBusy('saving');
+    setScanError(null);
+    try {
+      const now = new Date().toISOString();
+      const parsedDate = r.receipt_date ? new Date(r.receipt_date) : null;
+      const expenseDate =
+        parsedDate && !Number.isNaN(parsedDate.getTime()) ? parsedDate.toISOString() : now;
+      const expenseId = uuidv4();
+      const idByLine = new Map(r.items.map((i) => [i.line, uuidv4()]));
+      // Main items before add-ons, so an add-on's modifier_of_item_id always
+      // points at a row that was already inserted (and uploaded) first.
+      const ordered = [
+        ...r.items.filter((i) => i.modifier_of_line == null || !idByLine.has(i.modifier_of_line)),
+        ...r.items.filter((i) => i.modifier_of_line != null && idByLine.has(i.modifier_of_line)),
+      ];
+      const flagged = [
+        ...r.uncertain_fields,
+        ...r.items.filter((i) => i.uncertain).map((i) => `item:${i.line}`),
+      ];
+
+      await powersync.writeTransaction(async (tx) => {
+        await tx.execute(
+          `INSERT INTO expense
+             (id, trip_id, paid_by, photographed_by, image_url, merchant, description, expense_date,
+              type, status, total, receipt_total, tax, tip, needs_review, flagged_fields, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            expenseId,
+            tripId,
+            scanPayerId,
+            currentUserId ?? null,
+            scan.path,
+            r.merchant,
+            r.merchant ?? 'Receipt',
+            expenseDate,
+            'scanned',
+            'pending',
+            Math.round((paid + tip) * 100) / 100,
+            r.total,
+            r.tax ?? 0,
+            tip,
+            scan.problems.length > 0 ? 1 : 0,
+            flagged.length > 0 ? JSON.stringify(flagged) : null,
+            now,
+          ]
+        );
+        for (const i of ordered) {
+          await tx.execute(
+            `INSERT INTO expense_item
+               (id, expense_id, description, price, quantity, modifier_of_item_id, line_order, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              idByLine.get(i.line),
+              expenseId,
+              i.description,
+              i.price,
+              Math.max(1, Math.round(i.quantity || 1)),
+              i.modifier_of_line != null ? idByLine.get(i.modifier_of_line) ?? null : null,
+              i.line,
+              now,
+            ]
+          );
+        }
+      });
+      setScan(null);
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanBusy(null);
     }
   }
 
@@ -221,13 +427,14 @@ export default function TripDetailScreen() {
           [expenseId, tripId, payerId, desc, now, 'manual', 'pending', amountNum, 0, 0, 0, now]
         );
         await tx.execute(
-          `INSERT INTO expense_item (id, expense_id, description, price, quantity, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [uuidv4(), expenseId, desc, amountNum, 1, now]
+          `INSERT INTO expense_item (id, expense_id, description, price, quantity, line_order, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [uuidv4(), expenseId, desc, amountNum, 1, 1, now]
         );
       });
       setDescription('');
       setAmount('');
+      setShowManual(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -237,9 +444,7 @@ export default function TripDetailScreen() {
 
   // Self-claim only -- the database only allows inserting a claim for
   // yourself (or as a declared sponsor, Stage 1c, not built yet), so each
-  // trip member checks off their own share on their own device rather than
-  // the expense creator claiming on everyone's behalf (that's the
-  // group-activity tagging feature, deliberately deferred to Milestone 6).
+  // trip member checks off their own items on their own device.
   async function toggleClaim(item: ItemRow) {
     if (!currentUserId) return;
     const existing = (claimsByItem.get(item.id) ?? []).find(
@@ -253,6 +458,107 @@ export default function TripDetailScreen() {
         [uuidv4(), item.id, currentUserId, new Date().toISOString()]
       );
     }
+  }
+
+  const youClaimed = (itemId: string) =>
+    (claimsByItem.get(itemId) ?? []).some((c) => c.participant_person_id === currentUserId);
+
+  function renderScanReview() {
+    if (!scan) return null;
+    const r = scan.receipt;
+    const byLine = new Map(r.items.map((i) => [i.line, i]));
+    const saving = scanBusy === 'saving';
+    return (
+      <View style={styles.reviewCard}>
+        <Text style={styles.expenseDescription}>{r.merchant ?? 'Receipt'}</Text>
+        {r.items.map((i) => (
+          <View key={i.line} style={[styles.itemRow, i.modifier_of_line != null && styles.addOnRow]}>
+            <Text style={styles.itemText}>
+              {i.modifier_of_line != null ? '+ ' : ''}
+              {i.quantity > 1 ? `${i.quantity} × ` : ''}
+              {i.description}
+              {i.uncertain ? '  ⚠️' : ''}
+            </Text>
+            <Text style={styles.itemPrice}>{i.price.toFixed(2)}</Text>
+          </View>
+        ))}
+        <Text style={styles.expenseMeta}>
+          {r.subtotal != null ? `Subtotal ${r.subtotal.toFixed(2)} · ` : ''}
+          {r.tax != null ? `Tax ${r.tax.toFixed(2)} · ` : ''}
+          {r.total != null ? `Total ${r.total.toFixed(2)}` : ''}
+        </Text>
+        {r.items.some((i) => i.modifier_of_line != null && byLine.has(i.modifier_of_line)) ? (
+          <Text style={styles.expenseMeta}>Add-ons (+) can be claimed separately.</Text>
+        ) : null}
+        {scan.problems.map((p) => (
+          <Text key={p} style={styles.error}>
+            ⚠️ {p}
+          </Text>
+        ))}
+        {r.items.some((i) => i.uncertain) ? (
+          <Text style={styles.warning}>⚠️ marks lines that were hard to read. Check them against the receipt.</Text>
+        ) : null}
+        {r.notes ? <Text style={styles.expenseMeta}>{r.notes}</Text> : null}
+
+        <Text style={[styles.label, { marginTop: 12 }]}>Paid by</Text>
+        <View style={styles.typeRow}>
+          {(members ?? []).map((member) => (
+            <Pressable
+              key={member.person_id}
+              style={[styles.typeButton, scanPayerId === member.person_id && styles.typeButtonSelected]}
+              onPress={() => setScanPayerId(member.person_id)}
+              disabled={saving}
+            >
+              <Text
+                style={[
+                  styles.typeButtonText,
+                  scanPayerId === member.person_id && styles.typeButtonTextSelected,
+                ]}
+              >
+                {member.name}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+        <Text style={styles.label}>Amount paid, before tip</Text>
+        {r.amount_charged != null && r.total != null && r.amount_charged !== r.total ? (
+          <Text style={styles.warning}>
+            Split check: this receipt shows {formatMoney(r.amount_charged)} charged of a{' '}
+            {formatMoney(r.total)} bill.
+          </Text>
+        ) : (
+          <Text style={styles.expenseMeta}>Split the bill? Enter just the part you paid.</Text>
+        )}
+        <TextInput
+          style={styles.input}
+          keyboardType="decimal-pad"
+          value={scanPaid}
+          onChangeText={setScanPaid}
+          editable={!saving}
+        />
+        <Text style={styles.label}>Tip you added</Text>
+        <TextInput
+          style={styles.input}
+          keyboardType="decimal-pad"
+          placeholder="0.00"
+          value={scanTip}
+          onChangeText={setScanTip}
+          editable={!saving}
+        />
+        <View style={styles.typeRow}>
+          <Pressable
+            style={[styles.button, styles.halfButton, styles.cancelButton]}
+            onPress={() => setScan(null)}
+            disabled={saving}
+          >
+            <Text style={styles.buttonText}>Discard</Text>
+          </Pressable>
+          <Pressable style={[styles.button, styles.halfButton]} onPress={saveScan} disabled={saving}>
+            {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Save expense</Text>}
+          </Pressable>
+        </View>
+      </View>
+    );
   }
 
   return (
@@ -300,30 +606,39 @@ export default function TripDetailScreen() {
               <Pressable
                 style={[styles.button, styles.halfButton]}
                 onPress={takePhoto}
-                disabled={scanBusy}
+                disabled={scanBusy != null}
               >
                 <Text style={styles.buttonText}>Take photo</Text>
               </Pressable>
               <Pressable
                 style={[styles.button, styles.halfButton]}
                 onPress={pickPhoto}
-                disabled={scanBusy}
+                disabled={scanBusy != null}
               >
                 <Text style={styles.buttonText}>Choose photo</Text>
               </Pressable>
             </View>
-            {scanBusy ? <ActivityIndicator style={{ marginTop: 4, marginBottom: 8 }} /> : null}
-            {scanError ? <Text style={styles.error}>{scanError}</Text> : null}
-            {lastScanPath ? (
-              <Text style={styles.label}>
-                Uploaded. OCR parsing comes next, once we've checked extraction quality on real
-                receipts.
-              </Text>
+            {scanBusy === 'uploading' || scanBusy === 'reading' ? (
+              <View style={styles.busyRow}>
+                <ActivityIndicator />
+                <Text style={styles.expenseMeta}>
+                  {scanBusy === 'uploading' ? 'Uploading photo…' : 'Reading receipt… (about 10 seconds)'}
+                </Text>
+              </View>
             ) : null}
+            {scanError ? <Text style={styles.error}>{scanError}</Text> : null}
+            {renderScanReview()}
 
-            <Text style={styles.sectionTitle}>Add an expense</Text>
+            {!showManual ? (
+              <Pressable style={styles.secondaryButton} onPress={() => setShowManual(true)}>
+                <Text style={styles.secondaryButtonText}>+ Add a cash expense (no receipt)</Text>
+              </Pressable>
+            ) : (
+            <View>
+            <Text style={styles.sectionTitle}>Add a cash expense</Text>
+            <Text style={styles.expenseMeta}>For things without a receipt, like a cash tip or a taxi.</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, { marginTop: 8 }]}
               placeholder="Description"
               value={description}
               onChangeText={setDescription}
@@ -365,7 +680,19 @@ export default function TripDetailScreen() {
               )}
             </Pressable>
 
+            <Pressable
+              style={[styles.secondaryButton, { marginTop: 8 }]}
+              onPress={() => {
+                setShowManual(false);
+                setError(null);
+              }}
+              disabled={busy}
+            >
+              <Text style={styles.secondaryButtonText}>Cancel</Text>
+            </Pressable>
             {error ? <Text style={styles.error}>{error}</Text> : null}
+            </View>
+            )}
 
             <Text style={styles.sectionTitle}>Expenses</Text>
             {expensesLoading ? <ActivityIndicator style={{ marginTop: 12 }} /> : null}
@@ -374,32 +701,93 @@ export default function TripDetailScreen() {
         ListEmptyComponent={
           !expensesLoading ? <Text style={styles.empty}>No expenses yet -- add one above.</Text> : null
         }
-        renderItem={({ item }) => {
-          const expenseItem = itemByExpense.get(item.id);
-          const itemClaims = expenseItem ? claimsByItem.get(expenseItem.id) ?? [] : [];
-          const youClaimed = itemClaims.some((c) => c.participant_person_id === currentUserId);
-          const claimantNames = itemClaims.map((c) => memberName(c.participant_person_id)).join(', ');
+        renderItem={({ item: expense }) => {
+          const expenseItems = itemsByExpense.get(expense.id) ?? [];
+          const itemById = new Map(expenseItems.map((i) => [i.id, i]));
+          const isSplit =
+            expense.receipt_total != null &&
+            Math.abs(expense.receipt_total - (expense.total - (expense.tip ?? 0))) > 0.005;
 
           return (
             <View style={styles.expenseCard}>
               <View style={styles.expenseHeader}>
-                <Text style={styles.expenseDescription}>{item.description ?? 'Expense'}</Text>
-                <Text style={styles.expenseAmount}>{formatMoney(item.total)}</Text>
+                <Text style={styles.expenseDescription}>
+                  {expense.merchant ?? expense.description ?? 'Expense'}
+                </Text>
+                <Text style={styles.expenseAmount}>{formatMoney(expense.total)}</Text>
               </View>
-              <Text style={styles.expenseMeta}>Paid by {memberName(item.paid_by)}</Text>
               <Text style={styles.expenseMeta}>
-                {itemClaims.length === 0 ? 'Not claimed yet' : `Claimed by ${claimantNames}`}
+                Paid by {memberName(expense.paid_by)}
+                {expense.tip ? ` · incl. ${formatMoney(expense.tip)} tip` : ''}
               </Text>
-              {expenseItem ? (
-                <Pressable
-                  style={[styles.smallButton, youClaimed && styles.cancelButton]}
-                  onPress={() => toggleClaim(expenseItem)}
-                >
-                  <Text style={styles.buttonText}>
-                    {youClaimed ? "This wasn't mine" : 'This was mine'}
-                  </Text>
-                </Pressable>
+              {myShareByExpense.has(expense.id) ? (
+                <Text style={styles.yourShare}>
+                  Your share: {formatMoney(myShareByExpense.get(expense.id)!)}
+                  {expenseItems.length > 1 ? ' (incl. tax & tip)' : ''}
+                </Text>
               ) : null}
+              {isSplit ? (
+                <Text style={styles.expenseMeta}>
+                  Split check · whole bill {formatMoney(expense.receipt_total!)}
+                </Text>
+              ) : null}
+
+              {expenseItems.map((it) => {
+                const itemClaims = claimsByItem.get(it.id) ?? [];
+                const mine = youClaimed(it.id);
+                const names = itemClaims.map((c) => memberName(c.participant_person_id)).join(', ');
+                const isAddOn = it.modifier_of_item_id != null && itemById.has(it.modifier_of_item_id);
+                // Nave's idea (2026-11-01): when you claim an item that has
+                // add-ons printed under it, ask whether you had them too.
+                const addOnPrompts = mine
+                  ? expenseItems.filter(
+                      (a) =>
+                        a.modifier_of_item_id === it.id &&
+                        !youClaimed(a.id) &&
+                        !dismissedAddOns.has(a.id)
+                    )
+                  : [];
+                return (
+                  <View key={it.id}>
+                    <View style={[styles.itemRow, isAddOn && styles.addOnRow]}>
+                      <View style={{ flexShrink: 1 }}>
+                        <Text style={styles.itemText}>
+                          {isAddOn ? '+ ' : ''}
+                          {(it.quantity ?? 1) > 1 ? `${it.quantity} × ` : ''}
+                          {it.description ?? 'Item'}
+                          {'  '}
+                          <Text style={styles.itemPrice}>{it.price.toFixed(2)}</Text>
+                        </Text>
+                        {names ? <Text style={styles.claimedBy}>{names}</Text> : null}
+                      </View>
+                      <Pressable
+                        style={[styles.claimButton, mine && styles.cancelButton]}
+                        onPress={() => toggleClaim(it)}
+                      >
+                        <Text style={styles.buttonText}>{mine ? 'Not mine' : 'Mine'}</Text>
+                      </Pressable>
+                    </View>
+                    {addOnPrompts.map((a) => (
+                      <View key={a.id} style={styles.addOnPrompt}>
+                        <Text style={styles.itemText}>
+                          Did you also have the {a.description} (+{formatMoney(a.price)})?
+                        </Text>
+                        <View style={styles.typeRow}>
+                          <Pressable style={styles.claimButton} onPress={() => toggleClaim(a)}>
+                            <Text style={styles.buttonText}>Yes</Text>
+                          </Pressable>
+                          <Pressable
+                            style={[styles.claimButton, styles.cancelButton]}
+                            onPress={() => setDismissedAddOns((s) => new Set(s).add(a.id))}
+                          >
+                            <Text style={styles.buttonText}>No</Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                    ))}
+                  </View>
+                );
+              })}
             </View>
           );
         }}
@@ -449,18 +837,35 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: 'center',
   },
-  smallButton: {
+  claimButton: {
     backgroundColor: '#2f6fed',
     borderRadius: 8,
-    paddingVertical: 8,
+    paddingVertical: 6,
     paddingHorizontal: 12,
-    alignSelf: 'flex-start',
-    marginTop: 8,
   },
   cancelButton: { backgroundColor: '#999' },
+  secondaryButton: {
+    borderWidth: 1,
+    borderColor: '#2f6fed',
+    borderRadius: 8,
+    paddingVertical: 10,
+    alignItems: 'center',
+    marginTop: 16,
+  },
+  secondaryButtonText: { color: '#2f6fed', fontWeight: '600' },
+  yourShare: { color: '#2f6fed', fontWeight: '700', marginTop: 4, fontSize: 14 },
   buttonText: { color: '#fff', fontWeight: '600' },
   error: { color: '#d33', marginBottom: 8, marginTop: 4 },
+  warning: { color: '#b26a00', marginBottom: 6, marginTop: 2, fontSize: 13 },
   empty: { color: '#888', textAlign: 'center', marginTop: 24 },
+  busyRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  reviewCard: {
+    borderWidth: 1,
+    borderColor: '#2f6fed',
+    borderRadius: 10,
+    padding: 14,
+    marginBottom: 10,
+  },
   expenseCard: {
     borderWidth: 1,
     borderColor: '#eee',
@@ -476,4 +881,25 @@ const styles = StyleSheet.create({
   expenseDescription: { fontSize: 16, fontWeight: '600', flexShrink: 1 },
   expenseAmount: { fontSize: 16, fontWeight: '700' },
   expenseMeta: { color: '#666', marginTop: 2, fontSize: 13 },
+  itemRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#eee',
+  },
+  addOnRow: { paddingLeft: 16 },
+  itemText: { fontSize: 14, color: '#222' },
+  itemPrice: { fontSize: 14, color: '#666' },
+  claimedBy: { fontSize: 12, color: '#1a8f4c', marginTop: 2 },
+  addOnPrompt: {
+    backgroundColor: '#f3f6ff',
+    borderRadius: 8,
+    padding: 10,
+    marginTop: 6,
+    marginBottom: 4,
+    marginLeft: 16,
+  },
 });
