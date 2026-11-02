@@ -47,6 +47,7 @@ type ItemRow = {
   line_order: number | null;
 };
 type ClaimRow = { id: string; item_id: string; participant_person_id: string };
+type PaymentRow = { id: string; expense_id: string; person_id: string; amount: number; tip: number };
 
 // Shape returned by the ocr-receipt Edge Function
 // (supabase/functions/_shared/receipt-ocr.mjs RECEIPT_SCHEMA).
@@ -113,8 +114,11 @@ async function functionErrorMessage(error: unknown): Promise<string> {
 //   kept in expense.receipt_total.
 // - Tax and tip are shared in proportion to what each person claimed
 //   (Stage 1 #7): an item's effective cost is its printed price scaled by
-//   expense.total / (sum of the expense's item prices). For a manual
+//   (total paid) / (sum of the expense's item prices). For a manual
 //   expense the scale is 1.
+// - Split checks (option 1, decided 2026-11-01): other payers don't scan
+//   the receipt again; they "Add my payment" to the existing expense
+//   (expense_payment rows). Total paid = expense.total + those payments.
 export default function TripDetailScreen() {
   const params = useLocalSearchParams<{ id: string }>();
   const tripId = Array.isArray(params.id) ? params.id[0] : params.id ?? '';
@@ -159,6 +163,15 @@ export default function TripDetailScreen() {
     [tripId]
   );
 
+  const { data: payments } = useQuery<PaymentRow>(
+    `SELECT ep.id as id, ep.expense_id as expense_id, ep.person_id as person_id,
+            ep.amount as amount, ep.tip as tip
+     FROM expense_payment ep JOIN expense e ON e.id = ep.expense_id
+     WHERE e.trip_id = ?
+     ORDER BY ep.created_at`,
+    [tripId]
+  );
+
   const [description, setDescription] = useState('');
   const [amount, setAmount] = useState('');
   const [payerId, setPayerId] = useState<string | undefined>(currentUserId);
@@ -172,6 +185,13 @@ export default function TripDetailScreen() {
   const [scanPaid, setScanPaid] = useState('');
   const [scanTip, setScanTip] = useState('');
   const [scanPayerId, setScanPayerId] = useState<string | undefined>(currentUserId);
+
+  // "Add my payment" form (split checks), open for at most one expense.
+  const [payFor, setPayFor] = useState<string | null>(null);
+  const [payAmount, setPayAmount] = useState('');
+  const [payTip, setPayTip] = useState('');
+  const [payBusy, setPayBusy] = useState(false);
+  const [payError, setPayError] = useState<string | null>(null);
 
   // Add-on suggestions the user answered "No" to (this session only).
   const [dismissedAddOns, setDismissedAddOns] = useState<Set<string>>(new Set());
@@ -201,6 +221,31 @@ export default function TripDetailScreen() {
     return map;
   }, [claims]);
 
+  const paymentsByExpense = useMemo(() => {
+    const map = new Map<string, PaymentRow[]>();
+    for (const payment of payments ?? []) {
+      const list = map.get(payment.expense_id) ?? [];
+      list.push(payment);
+      map.set(payment.expense_id, list);
+    }
+    return map;
+  }, [payments]);
+
+  const totalPaid = (expense: ExpenseRow) =>
+    expense.total +
+    (paymentsByExpense.get(expense.id) ?? []).reduce((s, p) => s + p.amount + p.tip, 0);
+
+  // Part of a scanned bill (before tips) that no payer has covered yet.
+  const uncovered = (expense: ExpenseRow) => {
+    if (expense.type !== 'scanned' || expense.receipt_total == null) return 0;
+    const covered =
+      expense.total -
+      (expense.tip ?? 0) +
+      (paymentsByExpense.get(expense.id) ?? []).reduce((s, p) => s + p.amount, 0);
+    const left = Math.round((expense.receipt_total - covered) * 100) / 100;
+    return left > 0 ? left : 0;
+  };
+
   // Running tally: what each person paid, minus their share of what they
   // claimed (tax/tip included proportionally -- see the money model above).
   // Unclaimed items don't count against anyone yet.
@@ -209,9 +254,12 @@ export default function TripDetailScreen() {
     for (const member of members ?? []) map.set(member.person_id, 0);
     for (const expense of expenses ?? []) {
       map.set(expense.paid_by, (map.get(expense.paid_by) ?? 0) + expense.total);
+      for (const p of paymentsByExpense.get(expense.id) ?? []) {
+        map.set(p.person_id, (map.get(p.person_id) ?? 0) + p.amount + p.tip);
+      }
       const expenseItems = itemsByExpense.get(expense.id) ?? [];
       const itemSum = expenseItems.reduce((s, i) => s + i.price, 0);
-      const scale = itemSum > 0 ? expense.total / itemSum : 1;
+      const scale = itemSum > 0 ? totalPaid(expense) / itemSum : 1;
       for (const item of expenseItems) {
         const itemClaims = claimsByItem.get(item.id) ?? [];
         if (itemClaims.length === 0) continue;
@@ -222,7 +270,8 @@ export default function TripDetailScreen() {
       }
     }
     return map;
-  }, [members, expenses, itemsByExpense, claimsByItem]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [members, expenses, itemsByExpense, claimsByItem, paymentsByExpense]);
 
   // What the current user owes for each expense: their claimed items'
   // prices, scaled for tax/tip exactly like the running tally above.
@@ -232,7 +281,7 @@ export default function TripDetailScreen() {
     for (const expense of expenses ?? []) {
       const expenseItems = itemsByExpense.get(expense.id) ?? [];
       const itemSum = expenseItems.reduce((s, i) => s + i.price, 0);
-      const scale = itemSum > 0 ? expense.total / itemSum : 1;
+      const scale = itemSum > 0 ? totalPaid(expense) / itemSum : 1;
       let mine = 0;
       for (const item of expenseItems) {
         const itemClaims = claimsByItem.get(item.id) ?? [];
@@ -243,7 +292,8 @@ export default function TripDetailScreen() {
       if (mine > 0) map.set(expense.id, mine);
     }
     return map;
-  }, [currentUserId, expenses, itemsByExpense, claimsByItem]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUserId, expenses, itemsByExpense, claimsByItem, paymentsByExpense]);
 
   // Milestone 3: upload the photo, then have the ocr-receipt Edge Function
   // read it, then show it for review before anything is saved.
@@ -440,6 +490,45 @@ export default function TripDetailScreen() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function openPayForm(expense: ExpenseRow) {
+    setPayFor(expense.id);
+    setPayAmount(uncovered(expense).toFixed(2));
+    setPayTip('');
+    setPayError(null);
+  }
+
+  async function addMyPayment(expense: ExpenseRow) {
+    if (!currentUserId) return;
+    const amt = parseMoney(payAmount);
+    const tip = parseMoney(payTip);
+    if (amt == null || amt <= 0) {
+      setPayError('Enter the amount you paid (before tip).');
+      return;
+    }
+    if (tip == null) {
+      setPayError('Tip must be a number (or leave it empty).');
+      return;
+    }
+    setPayBusy(true);
+    setPayError(null);
+    try {
+      await powersync.execute(
+        `INSERT INTO expense_payment (id, expense_id, person_id, amount, tip, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [uuidv4(), expense.id, currentUserId, amt, tip, new Date().toISOString()]
+      );
+      setPayFor(null);
+    } catch (e) {
+      setPayError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPayBusy(false);
+    }
+  }
+
+  async function removeMyPayment(payment: PaymentRow) {
+    await powersync.execute('DELETE FROM expense_payment WHERE id = ?', [payment.id]);
   }
 
   // Self-claim only -- the database only allows inserting a claim for
@@ -704,9 +793,11 @@ export default function TripDetailScreen() {
         renderItem={({ item: expense }) => {
           const expenseItems = itemsByExpense.get(expense.id) ?? [];
           const itemById = new Map(expenseItems.map((i) => [i.id, i]));
-          const isSplit =
-            expense.receipt_total != null &&
-            Math.abs(expense.receipt_total - (expense.total - (expense.tip ?? 0))) > 0.005;
+          const extraPayments = paymentsByExpense.get(expense.id) ?? [];
+          const left = uncovered(expense);
+          const iPaid =
+            expense.paid_by === currentUserId ||
+            extraPayments.some((p) => p.person_id === currentUserId);
 
           return (
             <View style={styles.expenseCard}>
@@ -714,22 +805,80 @@ export default function TripDetailScreen() {
                 <Text style={styles.expenseDescription}>
                   {expense.merchant ?? expense.description ?? 'Expense'}
                 </Text>
-                <Text style={styles.expenseAmount}>{formatMoney(expense.total)}</Text>
+                <Text style={styles.expenseAmount}>{formatMoney(totalPaid(expense))}</Text>
               </View>
               <Text style={styles.expenseMeta}>
                 Paid by {memberName(expense.paid_by)}
+                {extraPayments.length > 0 ? ` ${formatMoney(expense.total)}` : ''}
                 {expense.tip ? ` · incl. ${formatMoney(expense.tip)} tip` : ''}
               </Text>
+              {extraPayments.map((p) => (
+                <View key={p.id} style={styles.payerRow}>
+                  <Text style={styles.expenseMeta}>
+                    Paid by {memberName(p.person_id)} {formatMoney(p.amount + p.tip)}
+                    {p.tip ? ` · incl. ${formatMoney(p.tip)} tip` : ''}
+                  </Text>
+                  {p.person_id === currentUserId ? (
+                    <Pressable onPress={() => removeMyPayment(p)}>
+                      <Text style={styles.linkText}>Remove</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              ))}
               {myShareByExpense.has(expense.id) ? (
                 <Text style={styles.yourShare}>
                   Your share: {formatMoney(myShareByExpense.get(expense.id)!)}
                   {expenseItems.length > 1 ? ' (incl. tax & tip)' : ''}
                 </Text>
               ) : null}
-              {isSplit ? (
-                <Text style={styles.expenseMeta}>
-                  Split check · whole bill {formatMoney(expense.receipt_total!)}
+              {left > 0 ? (
+                <Text style={styles.warning}>
+                  Split check · whole bill {formatMoney(expense.receipt_total!)} ·{' '}
+                  {formatMoney(left)} not paid yet
                 </Text>
+              ) : null}
+              {left > 0 && !iPaid && payFor !== expense.id ? (
+                <Pressable style={styles.secondaryButtonSmall} onPress={() => openPayForm(expense)}>
+                  <Text style={styles.secondaryButtonText}>Add my payment</Text>
+                </Pressable>
+              ) : null}
+              {payFor === expense.id ? (
+                <View style={styles.addOnPrompt}>
+                  <Text style={styles.label}>Amount you paid, before tip</Text>
+                  <TextInput
+                    style={styles.input}
+                    keyboardType="decimal-pad"
+                    value={payAmount}
+                    onChangeText={setPayAmount}
+                    editable={!payBusy}
+                  />
+                  <Text style={styles.label}>Tip you added</Text>
+                  <TextInput
+                    style={styles.input}
+                    keyboardType="decimal-pad"
+                    placeholder="0.00"
+                    value={payTip}
+                    onChangeText={setPayTip}
+                    editable={!payBusy}
+                  />
+                  {payError ? <Text style={styles.error}>{payError}</Text> : null}
+                  <View style={styles.typeRow}>
+                    <Pressable
+                      style={[styles.claimButton, styles.cancelButton]}
+                      onPress={() => setPayFor(null)}
+                      disabled={payBusy}
+                    >
+                      <Text style={styles.buttonText}>Cancel</Text>
+                    </Pressable>
+                    <Pressable
+                      style={styles.claimButton}
+                      onPress={() => addMyPayment(expense)}
+                      disabled={payBusy}
+                    >
+                      <Text style={styles.buttonText}>Save payment</Text>
+                    </Pressable>
+                  </View>
+                </View>
               ) : null}
 
               {expenseItems.map((it) => {
@@ -853,6 +1002,18 @@ const styles = StyleSheet.create({
     marginTop: 16,
   },
   secondaryButtonText: { color: '#2f6fed', fontWeight: '600' },
+  secondaryButtonSmall: {
+    borderWidth: 1,
+    borderColor: '#2f6fed',
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    alignSelf: 'flex-start',
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  payerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  linkText: { color: '#2f6fed', fontSize: 13, fontWeight: '600' },
   yourShare: { color: '#2f6fed', fontWeight: '700', marginTop: 4, fontSize: 14 },
   buttonText: { color: '#fff', fontWeight: '600' },
   error: { color: '#d33', marginBottom: 8, marginTop: 4 },
