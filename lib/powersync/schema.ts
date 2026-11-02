@@ -52,7 +52,8 @@ const expense = new Table(
     status: column.text, // 'pending' | 'finalized'
     split_method: column.text, // 'even' | 'percent' | 'fixed'
     related_expense_id: column.text,
-    total: column.real,
+    total: column.real, // what this payer paid (for a split check, their part)
+    receipt_total: column.real, // bill total printed on the receipt (0004)
     tax: column.real,
     tip: column.real,
     needs_review: column.integer, // 0/1 -- Stage 3i
@@ -69,6 +70,8 @@ const expense_item = new Table(
     price: column.real,
     quantity: column.integer,
     split_from_item_id: column.text, // Stage 1f traceability/undo
+    modifier_of_item_id: column.text, // add-on printed under another item (0004)
+    line_order: column.integer, // printed order on the receipt (0004)
     created_at: column.text
   },
   { indexes: { expense: ['expense_id'] } }
