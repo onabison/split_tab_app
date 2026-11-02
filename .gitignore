@@ -43,3 +43,6 @@ yarn-error.*
 # local OCR test output / receipt photos (contain real receipt data)
 ocr-compare.log
 run-ios.log
+
+# Supabase CLI local state
+supabase/.temp/
